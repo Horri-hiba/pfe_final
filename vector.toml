@@ -1,0 +1,136 @@
+# ============================================================
+# Vector - Pipeline Multi-Topics
+# Topic 1 : network_alerts   → BGP flaps, interface errors, physique
+# Topic 2 : network_info     → device up/down, discovery, poller
+# Topic 3 : network_metrics  → composants, sensors, State
+# Topic 4 : network_all      → TOUS les événements
+# ============================================================
+
+[sources.tcp_input]
+type           = "socket"
+mode           = "tcp"
+address        = "0.0.0.0:6000"
+decoding.codec = "bytes"
+
+# ---- Transform : Parser le CSV EventLog ----
+[transforms.parse_eventlog]
+type   = "remap"
+inputs = ["tcp_input"]
+source = '''
+raw = string!(.message)
+
+if length(strip_whitespace(raw)) == 0 { abort }
+
+cleaned = strip_whitespace(raw)
+if starts_with(cleaned, "\"") && ends_with(cleaned, "\"") {
+  cleaned = slice!(cleaned, 1, length(cleaned) - 1)
+}
+cleaned = replace(cleaned, "\"\"", "\"")
+
+parsed, err = parse_csv(cleaned)
+if err != null { abort }
+if length(parsed) < 8 { abort }
+
+if downcase(strip_whitespace(string!(parsed[0]))) == "id" { abort }
+
+device_id = strip_whitespace(string!(parsed[1]))
+if length(device_id) == 0 { abort }
+
+sev_raw  = strip_whitespace(string!(parsed[7]))
+severity = to_int(sev_raw) ?? 0
+
+severity_label = "unknown"
+if severity == 1 { severity_label = "ok" }
+if severity == 2 { severity_label = "info" }
+if severity == 3 { severity_label = "warning" }
+if severity == 4 { severity_label = "error" }
+if severity == 5 { severity_label = "critical" }
+
+event_type = strip_whitespace(string!(parsed[4]))
+ref_val    = strip_whitespace(string!(parsed[5]))
+ref_clean  = ref_val
+if ref_val == "\\N" || ref_val == "N" { ref_clean = "" }
+
+. = {
+  "event_id":       strip_whitespace(string!(parsed[0])),
+  "device_id":      device_id,
+  "ts":             strip_whitespace(string!(parsed[2])),
+  "message":        strip_whitespace(string!(parsed[3])),
+  "event_type":     event_type,
+  "ref":            ref_clean,
+  "extra":          strip_whitespace(string!(parsed[6])),
+  "severity":       severity,
+  "severity_label": severity_label,
+  "is_anomaly":     to_int(severity >= 4),
+  "ingested_at":    now()
+}
+'''
+
+# ---- Filter 1 : ALERTES ----
+[transforms.filter_alerts]
+type   = "filter"
+inputs = ["parse_eventlog"]
+condition = '''
+event_type = string!(.event_type)
+severity   = int!(.severity)
+
+(includes(["bgpPeer", "reboot", "stp", "current"], event_type) && severity >= 4) ||
+(includes(["interface", "ipv4"], event_type) && severity >= 4) ||
+(includes(["temperature", "voltage", "dbm"], event_type) && severity >= 4)
+'''
+
+# ---- Filter 2 : INFORMATIONS ----
+[transforms.filter_info]
+type   = "filter"
+inputs = ["parse_eventlog"]
+condition = '''
+event_type = string!(.event_type)
+severity   = int!(.severity)
+
+includes(["up", "down", "discovery", "poller", "system", "alert"], event_type) ||
+(event_type == "bgpPeer" && severity <= 2)
+'''
+
+# ---- Filter 3 : METRIQUES ----
+[transforms.filter_metrics]
+type   = "filter"
+inputs = ["parse_eventlog"]
+condition = '''
+event_type = string!(.event_type)
+includes(["component", "State", "sensor", "processors"], event_type)
+'''
+
+# ---- Console debug ----
+[sinks.console_debug]
+type   = "console"
+inputs = ["parse_eventlog"]
+encoding.codec = "json"
+
+# ---- Kafka : 4 topics ----
+[sinks.kafka_alerts]
+type              = "kafka"
+inputs            = ["filter_alerts"]
+bootstrap_servers = "kafka:9092"
+topic             = "network_alerts"
+encoding.codec    = "json"
+
+[sinks.kafka_info]
+type              = "kafka"
+inputs            = ["filter_info"]
+bootstrap_servers = "kafka:9092"
+topic             = "network_info"
+encoding.codec    = "json"
+
+[sinks.kafka_metrics]
+type              = "kafka"
+inputs            = ["filter_metrics"]
+bootstrap_servers = "kafka:9092"
+topic             = "network_metrics"
+encoding.codec    = "json"
+
+[sinks.kafka_all]
+type              = "kafka"
+inputs            = ["parse_eventlog"]
+bootstrap_servers = "kafka:9092"
+topic             = "network_all"
+encoding.codec    = "json"

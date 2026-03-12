@@ -1,0 +1,184 @@
+services:
+
+  # ─── Zookeeper ───────────────────────────────────────────────────────────────
+  zookeeper-batch:
+    image: wurstmeister/zookeeper
+    container_name: zookeeper_batch
+    ports:
+      - "2182:2181"
+    networks:
+      - batch-net
+
+  # ─── Kafka ────────────────────────────────────────────────────────────────────
+  kafka-batch:
+    image: wurstmeister/kafka
+    container_name: kafka_batch
+    depends_on:
+      - zookeeper-batch
+    ports:
+      - "9093:9092"
+    environment:
+      KAFKA_BROKER_ID: 2
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper-batch:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-batch:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CREATE_TOPICS: "network_all:1:1,network_alerts:1:1,network_metrics:1:1,network_info:1:1"
+    networks:
+      - batch-net
+
+  # ─── Unzip CSV ────────────────────────────────────────────────────────────────
+  unzipper:
+    image: ubuntu:24.04
+    container_name: unzipper_batch
+    volumes:
+      - ./data:/data
+      - ./unzip.sh:/unzip.sh
+    command: bash /unzip.sh
+    networks:
+      - batch-net
+
+  # ─── Logstash: CSV → 4 Kafka topics ─────────────────────────────────────────
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.13.0
+    container_name: logstash_batch
+    volumes:
+      - ./logstash-batch.conf:/usr/share/logstash/pipeline/logstash.conf
+      - ./data:/data
+    environment:
+      LS_JAVA_OPTS: "-Xmx512m -Xms512m"
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["until bash -c 'cat < /dev/null > /dev/tcp/kafka-batch/9092' 2>/dev/null; do echo '[WAIT] Kafka pas pret, attente 5s...'; sleep 5; done && echo '[WAIT] Kafka pret!' && sleep 3 && exec /usr/share/logstash/bin/logstash"]
+    depends_on:
+      - kafka-batch
+      - unzipper
+    networks:
+      - batch-net
+
+  # ─── MinIO single node ────────────────────────────────────────────────────────
+  minio1:
+    image: quay.io/minio/minio:latest
+    container_name: minio1_batch
+    hostname: minio1
+    command: server /data --console-address ":9001"
+    ports:
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio1-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - batch-net
+
+  # ─── Init buckets MinIO ───────────────────────────────────────────────────────
+  minio-init:
+    image: python:3.12-slim
+    container_name: minio_init_batch
+    volumes:
+      - ./init_minio_bucket.py:/app/init_minio_bucket.py
+    working_dir: /app
+    command: >
+      sh -c "
+      pip install boto3 --quiet &&
+      until python init_minio_bucket.py; do
+        echo 'MinIO not ready, retrying...';
+        sleep 3;
+      done
+      "
+    networks:
+      - batch-net
+    depends_on:
+      minio1:
+        condition: service_healthy
+
+  # ─── Iceberg REST Catalog ─────────────────────────────────────────────────────
+  iceberg-rest:
+    image: tabulario/iceberg-rest:latest
+    container_name: iceberg_rest_batch
+    environment:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://iceberg/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio1:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      AWS_S3_ENDPOINT: http://minio1:9000
+    ports:
+      - "8181:8181"
+    networks:
+      - batch-net
+    depends_on:
+      minio1:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  # ─── Spark: Kafka → Bronze / Silver / Gold ────────────────────────────────────
+  spark-batch:
+    image: apache/spark:3.5.3-scala2.12-java11-python3-ubuntu
+    container_name: spark_batch
+    environment:
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_DEFAULT_REGION: us-east-1
+    user: root
+    volumes:
+      - ./spark_batch_iceberg.py:/opt/spark/work-dir/spark_batch_iceberg.py
+      - ./spark-jars:/opt/spark/extra-jars
+    entrypoint: ["/bin/bash", "-c"]
+    command: ["apt-get install -y -q curl 2>/dev/null || true && echo 'Waiting for MinIO...' && until curl -sf http://minio1:9000/minio/health/live; do echo 'MinIO not ready...'; sleep 3; done && echo 'MinIO OK' && echo 'Waiting for Iceberg REST...' && until curl -sf http://iceberg-rest:8181/v1/config; do echo 'Iceberg REST not ready...'; sleep 3; done && echo 'Iceberg REST OK' && echo 'Waiting for Kafka...' && until bash -c 'cat < /dev/null > /dev/tcp/kafka-batch/9092' 2>/dev/null; do echo 'Kafka not ready...'; sleep 3; done && echo 'ALL SERVICES READY - Starting Spark...' && sleep 5 && chmod 755 /opt/spark/work-dir/spark_batch_iceberg.py && /opt/spark/bin/spark-submit --master local[*] --driver-memory 4g --conf spark.memory.fraction=0.8 --conf spark.sql.shuffle.partitions=4 --conf spark.default.parallelism=4 --jars /opt/spark/extra-jars/iceberg-spark-runtime-3.5_2.12-1.5.0.jar,/opt/spark/extra-jars/spark-sql-kafka-0-10_2.12-3.5.3.jar,/opt/spark/extra-jars/spark-token-provider-kafka-0-10_2.12-3.5.3.jar,/opt/spark/extra-jars/kafka-clients-3.4.1.jar,/opt/spark/extra-jars/bundle-2.21.1.jar,/opt/spark/extra-jars/hadoop-aws-3.3.4.jar,/opt/spark/extra-jars/aws-java-sdk-bundle-1.12.262.jar,/opt/spark/extra-jars/commons-pool2-2.11.1.jar --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.iceberg=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.iceberg.type=rest --conf spark.sql.catalog.iceberg.uri=http://iceberg-rest:8181 --conf spark.sql.catalog.iceberg.warehouse=s3://iceberg/ --conf spark.sql.catalog.iceberg.io-impl=org.apache.iceberg.aws.s3.S3FileIO --conf spark.sql.catalog.iceberg.s3.endpoint=http://minio1:9000 --conf spark.hadoop.fs.s3a.endpoint=http://minio1:9000 --conf spark.hadoop.fs.s3a.access.key=minioadmin --conf spark.hadoop.fs.s3a.secret.key=minioadmin --conf spark.hadoop.fs.s3a.path.style.access=true --conf spark.sql.catalog.iceberg.s3.region=us-east-1 --conf spark.sql.catalog.iceberg.client.region=us-east-1 --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider --conf spark.driver.extraJavaOptions=-Daws.region=us-east-1 --conf spark.executor.extraJavaOptions=-Daws.region=us-east-1 /opt/spark/work-dir/spark_batch_iceberg.py"]
+    networks:
+      - batch-net
+    depends_on:
+      - kafka-batch
+      - iceberg-rest
+      - logstash
+    restart: on-failure
+
+  # ─── Trino ────────────────────────────────────────────────────────────────────
+  trino:
+    image: trinodb/trino:439
+    container_name: trino_batch
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog
+    networks:
+      - batch-net
+    depends_on:
+      - iceberg-rest
+
+  # ─── Grafana ──────────────────────────────────────────────────────────────────
+  grafana-batch:
+    image: grafana/grafana:latest
+    container_name: grafana_batch
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_INSTALL_PLUGINS: "trino-datasource"
+    volumes:
+      - grafana-batch-data:/var/lib/grafana
+    networks:
+      - batch-net
+    depends_on:
+      - trino
+
+networks:
+  batch-net:
+    driver: bridge
+
+volumes:
+  minio1-data:
+  grafana-batch-data:

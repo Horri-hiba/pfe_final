@@ -105,14 +105,14 @@ services:
         condition: service_healthy
     networks:
       - pfe-net
-      
+      - batch-net
+
 networks:
   pfe-net:
     driver: bridge
+  batch-net:
+    external: true
 
 volumes:
   grafana-data:
   clickhouse-data:
-  minio1-data:
-  minio2-data:
-  minio3-data:

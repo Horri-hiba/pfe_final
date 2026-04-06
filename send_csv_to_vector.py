@@ -2,13 +2,17 @@ import socket
 import time
 from pathlib import Path
 
-# ===== Config =====
+
 VECTOR_HOST   = "vector"
 VECTOR_PORT   = 6000
 DATA_DIR      = Path("/data")
-SEND_INTERVAL = 2 # 2 secondes entre chaque ligne = simulation temps réel
+SEND_INTERVAL = 2
 
-# ===== Attendre que Vector soit prêt =====
+
+
+
+
+
 def wait_for_vector():
     print(f"Attente de Vector sur {VECTOR_HOST}:{VECTOR_PORT}...")
     while True:
@@ -21,17 +25,22 @@ def wait_for_vector():
             print("  Vector pas encore prêt, retry dans 2s...")
             time.sleep(2)
 
-# ===== Fonction principale =====
+
+
+
+
+
 def main():
     wait_for_vector()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((VECTOR_HOST, VECTOR_PORT))
     print(f"Connecté à Vector sur {VECTOR_HOST}:{VECTOR_PORT}")
-
+    
     total_sent = 0
+
     try:
-        # Cherche tous les CSV dans data/ (peu importe la structure)
+
         csv_files = sorted(DATA_DIR.rglob("*.csv"))
         print(f"{len(csv_files)} fichier(s) CSV trouvé(s)")
 
@@ -54,6 +63,9 @@ def main():
     finally:
         sock.close()
         print(f"\nTotal envoyé : {total_sent} lignes")
+
+
+
 
 if __name__ == "__main__":
     main()

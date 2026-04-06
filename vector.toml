@@ -1,10 +1,7 @@
-# ============================================================
-# Vector - Pipeline Multi-Topics
-# Topic 1 : network_alerts   → BGP flaps, interface errors, physique
-# Topic 2 : network_info     → device up/down, discovery, poller
-# Topic 3 : network_metrics  → composants, sensors, State
-# Topic 4 : network_all      → TOUS les événements
-# ============================================================
+
+
+
+
 
 [sources.tcp_input]
 type           = "socket"
@@ -12,125 +9,264 @@ mode           = "tcp"
 address        = "0.0.0.0:6000"
 decoding.codec = "bytes"
 
-# ---- Transform : Parser le CSV EventLog ----
-[transforms.parse_eventlog]
+# ── Parsing + enrichissement ──────────────────────────────────────────────────
+[transforms.parse_fortinet]
 type   = "remap"
 inputs = ["tcp_input"]
 source = '''
 raw = string!(.message)
-
 if length(strip_whitespace(raw)) == 0 { abort }
 
 cleaned = strip_whitespace(raw)
 if starts_with(cleaned, "\"") && ends_with(cleaned, "\"") {
   cleaned = slice!(cleaned, 1, length(cleaned) - 1)
 }
-cleaned = replace(cleaned, "\"\"", "\"")
 
-parsed, err = parse_csv(cleaned)
+parsed, err = parse_csv(cleaned, delimiter: ";")
 if err != null { abort }
 if length(parsed) < 8 { abort }
 
-if downcase(strip_whitespace(string!(parsed[0]))) == "id" { abort }
+if downcase(strip_whitespace(string!(parsed[0]))) == "device_id" { abort }
 
-device_id = strip_whitespace(string!(parsed[1]))
+device_id = strip_whitespace(string!(parsed[0]))
 if length(device_id) == 0 { abort }
 
-sev_raw  = strip_whitespace(string!(parsed[7]))
-severity = to_int(sev_raw) ?? 0
+facility_raw = to_int(strip_whitespace(string!(parsed[1]))) ?? 1
+priority_raw = to_int(strip_whitespace(string!(parsed[2]))) ?? 7
+tag          = strip_whitespace(string!(parsed[4]))
+ts           = strip_whitespace(string!(parsed[5]))
+program      = strip_whitespace(string!(parsed[6]))
 
-severity_label = "unknown"
-if severity == 1 { severity_label = "ok" }
-if severity == 2 { severity_label = "info" }
-if severity == 3 { severity_label = "warning" }
-if severity == 4 { severity_label = "error" }
-if severity == 5 { severity_label = "critical" }
+seq = if length(parsed) > 8 {
+  strip_whitespace(string!(parsed[8]))
+} else { "0" }
 
-event_type = strip_whitespace(string!(parsed[4]))
-ref_val    = strip_whitespace(string!(parsed[5]))
-ref_clean  = ref_val
-if ref_val == "\\N" || ref_val == "N" { ref_clean = "" }
+msg_raw   = strip_whitespace(string!(parsed[7]))
+msg_clean = replace(msg_raw, "\"\"", "\"")
+msg_clean = replace(msg_clean, "\"", "")
+
+
+latency_match = parse_regex(msg_clean, r'latency:\s*(?P<lat>[0-9]+(?:\.[0-9]+)?)') ?? {}
+latency = to_float(latency_match.lat) ?? 0.0
+
+kv, kv_err = parse_key_value(msg_clean, key_value_delimiter: "=", field_delimiter: " ")
+
+event_type  = "unknown"
+subtype     = ""
+action      = ""
+status      = ""
+logid       = ""
+logdesc     = ""
+srcip       = ""
+dstip       = ""
+srcport     = 0
+dstport     = 0
+proto       = 0
+service     = ""
+policyname  = ""
+policytype  = ""
+poluuid     = ""
+sentbyte    = 0
+rcvdbyte    = 0
+sessionid   = ""
+vwlid       = 0
+vwlquality  = ""
+devname     = ""
+devtype     = ""
+srchwvendor = ""
+srcmac      = ""
+eventtime   = ""
+
+if kv_err == null {
+  if exists(kv.type)        { event_type  = string!(kv.type) }
+  if exists(kv.subtype)     { subtype     = string!(kv.subtype) }
+  if exists(kv.action)      { action      = string!(kv.action) }
+  if exists(kv.status)      { status      = string!(kv.status) }
+  if exists(kv.logid)       { logid       = string!(kv.logid) }
+  if exists(kv.logdesc)     { logdesc     = string!(kv.logdesc) }
+  if exists(kv.srcip)       { srcip       = string!(kv.srcip) }
+  if exists(kv.dstip)       { dstip       = string!(kv.dstip) }
+  if exists(kv.srcport)     { srcport     = to_int(kv.srcport)   ?? 0 }
+  if exists(kv.dstport)     { dstport     = to_int(kv.dstport)   ?? 0 }
+  if exists(kv.proto)       { proto       = to_int(kv.proto)     ?? 0 }
+  if exists(kv.service)     { service     = string!(kv.service) }
+  if exists(kv.policyname)  { policyname  = string!(kv.policyname) }
+  if exists(kv.policytype)  { policytype  = string!(kv.policytype) }
+  if exists(kv.poluuid)     { poluuid     = string!(kv.poluuid) }
+  if exists(kv.sentbyte)    { sentbyte    = to_int(kv.sentbyte)  ?? 0 }
+  if exists(kv.rcvdbyte)    { rcvdbyte    = to_int(kv.rcvdbyte)  ?? 0 }
+  if exists(kv.sessionid)   { sessionid   = string!(kv.sessionid) }
+  if exists(kv.vwlid)       { vwlid       = to_int(kv.vwlid)     ?? 0 }
+  if exists(kv.vwlquality)  { vwlquality  = string!(kv.vwlquality) }
+  if exists(kv.devname)     { devname     = string!(kv.devname) }
+  if exists(kv.devtype)     { devtype     = string!(kv.devtype) }
+  if exists(kv.srchwvendor) { srchwvendor = string!(kv.srchwvendor) }
+  if exists(kv.srcmac)      { srcmac      = string!(kv.srcmac) }
+  if exists(kv.eventtime)   { eventtime   = string!(kv.eventtime) }
+}
+
+
+severity       = 1
+severity_label = "ok"
+if priority_raw <= 2 { severity = 5; severity_label = "critical" }
+if priority_raw == 3 { severity = 4; severity_label = "error"    }
+if priority_raw == 4 { severity = 3; severity_label = "warning"  }
+if priority_raw == 5 { severity = 2; severity_label = "info"     }
+if priority_raw >= 6 { severity = 1; severity_label = "ok"       }
+
+# is_anomaly — CORRECTION : if/else VRL valide (to_int(bool) interdit)
+# Couvre les 4 cas présents dans les données réelles :
+#   status=failed | action=deny | action=fail | severity>=4
+#   + incohérence action=fail/deny + status=success
+is_anomaly = 0
+if status == "failed"                                           { is_anomaly = 1 }
+if action == "deny"                                             { is_anomaly = 1 }
+if action == "fail"                                             { is_anomaly = 1 }
+if severity >= 4                                                { is_anomaly = 1 }
+if (action == "fail" || action == "deny") && status == "success" { is_anomaly = 1 }
+
+total_bytes = sentbyte + rcvdbyte
+
+message_label = if length(logdesc) > 0 {
+  logdesc
+} else {
+  if length(msg_clean) > 200 { slice!(msg_clean, 0, 200) } else { msg_clean }
+}
 
 . = {
-  "event_id":       strip_whitespace(string!(parsed[0])),
+  "event_id":       logid,
   "device_id":      device_id,
-  "ts":             strip_whitespace(string!(parsed[2])),
-  "message":        strip_whitespace(string!(parsed[3])),
+  "ts":             ts,
+  "eventtime":      eventtime,
+  "message":        message_label,
+  "tag":            tag,
+  "program":        program,
+  "seq":            seq,
+  "facility":       facility_raw,
   "event_type":     event_type,
-  "ref":            ref_clean,
-  "extra":          strip_whitespace(string!(parsed[6])),
+  "subtype":        subtype,
+  "action":         action,
+  "status":         status,
+  "srcip":          srcip,
+  "dstip":          dstip,
+  "srcport":        srcport,
+  "dstport":        dstport,
+  "proto":          proto,
+  "service":        service,
+  "policyname":     policyname,
+  "policytype":     policytype,
+  "poluuid":        poluuid,
+  "sentbyte":       sentbyte,
+  "rcvdbyte":       rcvdbyte,
+  "total_bytes":    total_bytes,
+  "latency":        latency,
+  "sessionid":      sessionid,
+  "vwlid":          vwlid,
+  "vwlquality":     vwlquality,
+  "devname":        devname,
+  "devtype":        devtype,
+  "srchwvendor":    srchwvendor,
+  "srcmac":         srcmac,
   "severity":       severity,
   "severity_label": severity_label,
-  "is_anomaly":     to_int(severity >= 4),
+  "is_anomaly":     is_anomaly,
   "ingested_at":    now()
 }
 '''
 
-# ---- Filter 1 : ALERTES ----
-[transforms.filter_alerts]
+# ── TOPIC 1 : fg_security_events (~58% des lignes) ───────────────────────────
+# Tout ce qui est anormal : failures, deny, fail, severity élevée
+# → Dashboard sécurité Grafana : alertes temps réel, heatmap anomalies par IP
+[transforms.filter_security]
 type   = "filter"
-inputs = ["parse_eventlog"]
-condition = '''
-event_type = string!(.event_type)
-severity   = int!(.severity)
+inputs = ["parse_fortinet"]
+condition = '(int(.is_anomaly) ?? 0) == 1'
 
-(includes(["bgpPeer", "reboot", "stp", "current"], event_type) && severity >= 4) ||
-(includes(["interface", "ipv4"], event_type) && severity >= 4) ||
-(includes(["temperature", "voltage", "dbm"], event_type) && severity >= 4)
+# ── TOPIC 2 : fg_traffic_flow (~42% des lignes) ──────────────────────────────
+# Trafic 100% légitime : action=accept ET status=success
+# → Dashboard trafic : volume normal, top srcip/dstip, distribution subtype
+[transforms.filter_traffic]
+type   = "filter"
+inputs = ["parse_fortinet"]
+condition = '''
+(string(.action) ?? "") == "accept" &&
+(string(.status) ?? "") == "success"
 '''
 
-# ---- Filter 2 : INFORMATIONS ----
-[transforms.filter_info]
+# ── TOPIC 3 : fg_performance (~95% des lignes) ───────────────────────────────
+# Tout event avec des métriques mesurables (sentbyte OU rcvdbyte OU latence)
+# Quasi toutes les lignes ont sentbyte > 0 d'après l'échantillon
+# → Dashboard perf : latence SD-WAN, débit par policy/service, alertes >20ms
+[transforms.filter_performance]
 type   = "filter"
-inputs = ["parse_eventlog"]
+inputs = ["parse_fortinet"]
 condition = '''
-event_type = string!(.event_type)
-severity   = int!(.severity)
-
-includes(["up", "down", "discovery", "poller", "system", "alert"], event_type) ||
-(event_type == "bgpPeer" && severity <= 2)
+(to_int(.sentbyte)  ?? 0)   > 0 ||
+(to_int(.rcvdbyte)  ?? 0)   > 0 ||
+(to_float(.latency) ?? 0.0) > 0.0
 '''
 
-# ---- Filter 3 : METRIQUES ----
-[transforms.filter_metrics]
+# ── TOPIC 4 : fg_device_inventory (100% des lignes) ──────────────────────────
+# Tout event avec device_id + devtype identifiables
+# ClickHouse utilisera ReplacingMergeTree → 1 ligne par device_id (dédupliqué)
+# → Dashboard inventaire : carte équipements, distribution vendor/type
+[transforms.filter_devices]
 type   = "filter"
-inputs = ["parse_eventlog"]
+inputs = ["parse_fortinet"]
 condition = '''
-event_type = string!(.event_type)
-includes(["component", "State", "sensor", "processors"], event_type)
+length(string(.device_id) ?? "") > 0 &&
+length(string(.devtype)   ?? "") > 0
 '''
 
-# ---- Console debug ----
+# ── Console debug (à commenter en production) ─────────────────────────────────
 [sinks.console_debug]
 type   = "console"
-inputs = ["parse_eventlog"]
+inputs = ["parse_fortinet"]
 encoding.codec = "json"
 
-# ---- Kafka : 4 topics ----
-[sinks.kafka_alerts]
-type              = "kafka"
-inputs            = ["filter_alerts"]
-bootstrap_servers = "kafka:9092"
-topic             = "network_alerts"
-encoding.codec    = "json"
+# ── Sinks Kafka — 5 topics ────────────────────────────────────────────────────
 
-[sinks.kafka_info]
+[sinks.kafka_security]
 type              = "kafka"
-inputs            = ["filter_info"]
+inputs            = ["filter_security"]
 bootstrap_servers = "kafka:9092"
-topic             = "network_info"
+topic             = "fg_security_events"
 encoding.codec    = "json"
+batch.max_bytes   = 1048576
+batch.timeout_secs = 1
 
-[sinks.kafka_metrics]
+[sinks.kafka_traffic]
 type              = "kafka"
-inputs            = ["filter_metrics"]
+inputs            = ["filter_traffic"]
 bootstrap_servers = "kafka:9092"
-topic             = "network_metrics"
+topic             = "fg_traffic_flow"
 encoding.codec    = "json"
+batch.max_bytes   = 1048576
+batch.timeout_secs = 1
 
-[sinks.kafka_all]
+[sinks.kafka_performance]
 type              = "kafka"
-inputs            = ["parse_eventlog"]
+inputs            = ["filter_performance"]
 bootstrap_servers = "kafka:9092"
-topic             = "network_all"
+topic             = "fg_performance"
 encoding.codec    = "json"
+batch.max_bytes   = 1048576
+batch.timeout_secs = 1
+
+[sinks.kafka_devices]
+type              = "kafka"
+inputs            = ["filter_devices"]
+bootstrap_servers = "kafka:9092"
+topic             = "fg_device_inventory"
+encoding.codec    = "json"
+batch.max_bytes   = 524288
+batch.timeout_secs = 2
+
+[sinks.kafka_raw]
+type              = "kafka"
+inputs            = ["parse_fortinet"]
+bootstrap_servers = "kafka:9092"
+topic             = "fg_raw_all"
+encoding.codec    = "json"
+batch.max_bytes   = 2097152
+batch.timeout_secs = 1

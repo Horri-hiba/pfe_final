@@ -24,7 +24,7 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      KAFKA_CREATE_TOPICS: "network_alerts:1:1,network_info:1:1,network_metrics:1:1,network_all:1:1"
+      KAFKA_CREATE_TOPICS: "fg_security_events:1:1,fg_traffic_flow:1:1,fg_performance:1:1,fg_device_inventory:1:1,fg_raw_all:1:1"
     healthcheck:
       test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
       interval: 10s
@@ -45,8 +45,7 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    # Pas de healthcheck nc — Vector n'a pas netcat
-    # python_sender gère lui-même l'attente via socket Python
+        
     networks:
       - pfe-net
 

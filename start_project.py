@@ -59,17 +59,17 @@ def check_docker():
         result = subprocess.run(["docker", "info"],
                                 capture_output=True, text=True, timeout=10)
         if result.returncode == 0:
-            log("  ✅ Docker est actif", GREEN)
+            log("   Docker est actif", GREEN)
             return True
         else:
-            log("  ❌ Docker n'est pas lancé !", RED)
+            log("   Docker n'est pas lancé !", RED)
             log("  → Lance Docker Desktop ou démarre le service Docker", YELLOW)
             return False
     except FileNotFoundError:
-        log("  ❌ Docker introuvable — installe Docker", RED)
+        log("   Docker introuvable — installe Docker", RED)
         return False
     except subprocess.TimeoutExpired:
-        log("  ❌ Docker ne répond pas", RED)
+        log("   Docker ne répond pas", RED)
         return False
 
 def check_compose_files():
@@ -77,21 +77,21 @@ def check_compose_files():
     ok = True
     for f in [COMPOSE_REALTIME, COMPOSE_BATCH]:
         if f.exists():
-            log(f"  ✅ {f.name}", GREEN)
+            log(f"   {f.name}", GREEN)
         else:
-            log(f"  ❌ {f.name} introuvable dans {PROJECT_DIR}", RED)
+            log(f"   {f.name} introuvable dans {PROJECT_DIR}", RED)
             ok = False
     return ok
 
 def run_compose(compose_file, label):
     cmd = ["docker", "compose", "-f", str(compose_file), "up", "-d"]
-    log(f"\n🚀 Lancement {label}...", CYAN)
+    log(f"\n Lancement {label}...", CYAN)
     result = subprocess.run(cmd, cwd=str(PROJECT_DIR))
     if result.returncode == 0:
-        log(f"  ✅ {label} démarré avec succès", GREEN)
+        log(f"   {label} démarré avec succès", GREEN)
         return True
     else:
-        log(f"  ❌ Erreur lors du démarrage de {label}", RED)
+        log(f"   Erreur lors du démarrage de {label}", RED)
         return False
 
 def connect_grafana_to_batch_network():
@@ -100,7 +100,7 @@ def connect_grafana_to_batch_network():
     pour qu'il puisse accéder à Trino et aux services batch.
     Équivalent de : docker network connect batch-net grafana
     """
-    log(f"\n🔗 Connexion de Grafana au réseau batch ({BATCH_NETWORK})...", BLUE)
+    log(f"\n Connexion de Grafana au réseau batch ({BATCH_NETWORK})...", BLUE)
 
     # Vérifier si déjà connecté
     result = subprocess.run(
@@ -111,7 +111,7 @@ def connect_grafana_to_batch_network():
     current_networks = result.stdout.strip()
 
     if BATCH_NETWORK in current_networks:
-        log(f"  ✅ Grafana est déjà connecté à {BATCH_NETWORK}", GREEN)
+        log(f"   Grafana est déjà connecté à {BATCH_NETWORK}", GREEN)
         return True
 
     # Connecter au réseau batch
@@ -121,28 +121,28 @@ def connect_grafana_to_batch_network():
     )
 
     if result.returncode == 0:
-        log(f"  ✅ Grafana connecté à {BATCH_NETWORK} !", GREEN)
+        log(f"   Grafana connecté à {BATCH_NETWORK} !", GREEN)
         log(f"     → Il peut maintenant accéder à Trino ET ClickHouse", GREEN)
         return True
     else:
-        log(f"  ❌ Échec connexion réseau : {result.stderr.strip()}", RED)
+        log(f"   Échec connexion réseau : {result.stderr.strip()}", RED)
         log(f"  → Commande manuelle : docker network connect {BATCH_NETWORK} {GRAFANA_CONTAINER}", YELLOW)
         return False
 
 def wait_for_http(url, label, timeout=120, interval=5):
     import urllib.request
-    log(f"\n⏳ Attente de {label} sur {url}...", YELLOW)
+    log(f"\n Attente de {label} sur {url}...", YELLOW)
     start = time.time()
     while time.time() - start < timeout:
         try:
             urllib.request.urlopen(url, timeout=3)
-            log(f"  ✅ {label} est prêt !", GREEN)
+            log(f"   {label} est prêt !", GREEN)
             return True
         except Exception:
             elapsed = int(time.time() - start)
-            print(f"  ⏳ {elapsed}s/{timeout}s — pas encore prêt...", end="\r")
+            print(f"   {elapsed}s/{timeout}s — pas encore prêt...", end="\r")
             time.sleep(interval)
-    log(f"\n  ⚠️  {label} pas accessible après {timeout}s (démarre peut-être encore)", YELLOW)
+    log(f"\n    {label} pas accessible après {timeout}s (démarre peut-être encore)", YELLOW)
     return False
 
 def get_container_status(compose_file):
@@ -155,18 +155,18 @@ def get_container_status(compose_file):
 
 def print_status():
     log(f"\n{'─'*60}", CYAN)
-    log("📊 ÉTAT DES CONTAINERS — Real-Time", BOLD)
+    log(" ÉTAT DES CONTAINERS — Real-Time", BOLD)
     log(f"{'─'*60}", CYAN)
     print(get_container_status(COMPOSE_REALTIME))
 
     log(f"{'─'*60}", CYAN)
-    log("📊 ÉTAT DES CONTAINERS — Batch", BOLD)
+    log(" ÉTAT DES CONTAINERS — Batch", BOLD)
     log(f"{'─'*60}", CYAN)
     print(get_container_status(COMPOSE_BATCH))
 
 def print_access_urls():
     log(f"\n{'═'*60}", GREEN)
-    log("🌐  ACCÈS AUX SERVICES", BOLD)
+    log("  ACCÈS AUX SERVICES", BOLD)
     log(f"{'═'*60}", GREEN)
     log(f"  Grafana  (partagé)  →  {GRAFANA_URL}      (admin / admin)", CYAN)
     log(f"     ↳ Data sources   :  ClickHouse (real-time) + Trino (batch)", CYAN)
@@ -211,7 +211,7 @@ def start_ngrok():
         pass
 
     # Lancer ngrok en arrière-plan
-    log("  ⏳ Lancement de ngrok...", YELLOW)
+    log("   Lancement de ngrok...", YELLOW)
     try:
         subprocess.Popen(
             ["ngrok", "http", "3000", "--log=stdout"],
@@ -258,17 +258,17 @@ def start_ngrok():
 def open_browser():
     answer = input("  Ouvrir Grafana dans le navigateur ? (o/n) : ").strip().lower()
     if answer in ("o", "oui", "y", "yes"):
-        log("  🌍 Ouverture de Grafana...", BLUE)
+        log("   Ouverture de Grafana...", BLUE)
         webbrowser.open(GRAFANA_URL)
 
 def stop_all():
-    log("\n🛑 Arrêt de tous les containers...", YELLOW)
+    log("\n Arrêt de tous les containers...", YELLOW)
     subprocess.run(["docker", "compose", "-f", str(COMPOSE_REALTIME), "down"],
                    cwd=str(PROJECT_DIR))
     subprocess.run(["docker", "compose", "-f", str(COMPOSE_BATCH), "down"],
                    cwd=str(PROJECT_DIR))
-    log("  ✅ Tout arrêté.", GREEN)
-    log("  💡 Tes dashboards et données sont conservés dans les volumes Docker.", YELLOW)
+    log("  Tout arrêté.", GREEN)
+    log("  Tes dashboards et données sont conservés dans les volumes Docker.", YELLOW)
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
@@ -279,7 +279,7 @@ def main():
     if not check_docker():
         sys.exit(1)
     if not check_compose_files():
-        log(f"\n  ⚠️  Place start_project.py dans le dossier du projet", YELLOW)
+        log(f"\n    Place start_project.py dans le dossier du projet", YELLOW)
         sys.exit(1)
 
     # 2. Lancement Real-Time EN PREMIER (c'est lui qui a le Grafana partagé)
@@ -304,7 +304,7 @@ def main():
     connect_grafana_to_batch_network()
 
     # 5. Attente des autres services
-    log("\n⏳ Vérification des autres services...", YELLOW)
+    log("\n Vérification des autres services...", YELLOW)
     wait_for_http(CLICKHOUSE_URL, "ClickHouse", timeout=90)
     wait_for_http(MINIO_URL,      "MinIO",      timeout=90)
     wait_for_http(TRINO_URL,      "Trino",      timeout=120)
@@ -314,7 +314,7 @@ def main():
     print_access_urls()
 
     if not ok1 or not ok2:
-        log("  ⚠️  Certains services ont eu des erreurs.", YELLOW)
+        log("    Certains services ont eu des erreurs.", YELLOW)
         log("  → docker compose -f docker-compose.yml logs <service>  pour diagnostiquer\n", YELLOW)
 
     # 7. Ouvrir navigateur
@@ -323,9 +323,9 @@ def main():
     # 8. Lancer ngrok et afficher le lien pour le binôme
     start_ngrok()
 
-    log("\n✅ Projet lancé ! Bonne continuation 🎉\n", GREEN)
-    log("  💡 Pour tout arrêter proprement :", YELLOW)
-    log("     python3 start_project.py --stop\n", YELLOW)
+    log("\n Projet lancé ! Bonne continuation 🎉\n", GREEN)
+    log("   Pour tout arrêter proprement :", YELLOW)
+    log("    python3 start_project.py --stop\n", YELLOW)
 
 
 if __name__ == "__main__":

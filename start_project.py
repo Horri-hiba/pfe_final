@@ -3,8 +3,7 @@
 ╔══════════════════════════════════════════════════════════════╗
 ║           PFE PROJECT — LAUNCHER                             ║
 ║   Lance le projet Real-Time + Batch en une seule commande    ║
-║   Grafana unique (port 3000) connecté aux 2 réseaux          ║
-║   Usage : python start_project.py                            ║
+║   Grafana unique (port 3000) connecté aux 2 réseaux          ║                          ║
 ╚══════════════════════════════════════════════════════════════╝
 """
 
@@ -47,14 +46,13 @@ def log(msg, color=RESET):
 def banner():
     print(f"""
 {CYAN}{BOLD}
-╔══════════════════════════════════════════════════════╗
-║         PFE PROJECT LAUNCHER  🚀                     ║
+╔══════════════════════════════════════════════════════╗                    ║
 ║   Real-Time + Batch  →  Grafana partagé port 3000    ║
 ╚══════════════════════════════════════════════════════╝
 {RESET}""")
 
 def check_docker():
-    log("🔍 Vérification de Docker...", BLUE)
+    log(" Vérification de Docker...", BLUE)
     try:
         result = subprocess.run(["docker", "info"],
                                 capture_output=True, text=True, timeout=10)
@@ -73,7 +71,7 @@ def check_docker():
         return False
 
 def check_compose_files():
-    log("\n🔍 Vérification des fichiers docker-compose...", BLUE)
+    log("\n Vérification des fichiers docker-compose...", BLUE)
     ok = True
     for f in [COMPOSE_REALTIME, COMPOSE_BATCH]:
         if f.exists():
@@ -184,12 +182,12 @@ def start_ngrok():
     import json
 
     log(f"\n{'─'*60}", CYAN)
-    log("🌐  PARTAGE AVEC TON BINÔME — ngrok", BOLD)
+    log("  PARTAGE AVEC TON BINÔME — ngrok", BOLD)
     log(f"{'─'*60}", CYAN)
 
     # Vérifier que ngrok est installé
     if not shutil.which("ngrok"):
-        log("  ⚠️  ngrok n'est pas installé — lien de partage non disponible", YELLOW)
+        log("    ngrok n'est pas installé — lien de partage non disponible", YELLOW)
         log("  → Installe ngrok : https://ngrok.com/download", YELLOW)
         return None
 
@@ -202,8 +200,8 @@ def start_ngrok():
         for t in tunnels:
             if "3000" in t.get("config", {}).get("addr", ""):
                 url = t["public_url"].replace("http://", "https://")
-                log(f"  ✅ ngrok déjà actif !", GREEN)
-                log(f"\n  🔗 LIEN POUR TON BINÔME :", BOLD)
+                log(f"   ngrok déjà actif !", GREEN)
+                log(f"\n   LIEN POUR TON BINÔME :", BOLD)
                 log(f"     {url}", GREEN + BOLD)
                 log(f"\n  Identifiants Grafana : admin / admin", CYAN)
                 return url
@@ -219,7 +217,7 @@ def start_ngrok():
             stderr=subprocess.DEVNULL
         )
     except Exception as e:
-        log(f"  ❌ Impossible de lancer ngrok : {e}", RED)
+        log(f"   Impossible de lancer ngrok : {e}", RED)
         return None
 
     # Attendre que l'API ngrok soit prête et récupérer le lien
@@ -241,17 +239,17 @@ def start_ngrok():
                     url = tunnels[0]["public_url"].replace("http://", "https://")
 
                 if url:
-                    log(f"  ✅ Tunnel ngrok actif !", GREEN)
+                    log(f"   Tunnel ngrok actif !", GREEN)
                     log(f"\n  {'═'*50}", GREEN)
-                    log(f"  🔗 LIEN À ENVOYER À TON BINÔME :", BOLD)
+                    log(f"   LIEN À ENVOYER À TON BINÔME :", BOLD)
                     log(f"\n     {url}\n", GREEN + BOLD)
                     log(f"  Identifiants Grafana : admin / admin", CYAN)
                     log(f"  {'═'*50}\n", GREEN)
                     return url
         except Exception:
-            print(f"  ⏳ Attente ngrok... ({(i+1)*2}s)", end="\r")
+            print(f"   Attente ngrok... ({(i+1)*2}s)", end="\r")
 
-    log("\n  ❌ ngrok n'a pas démarré correctement", RED)
+    log("\n   ngrok n'a pas démarré correctement", RED)
     log("  → Lance manuellement dans un autre terminal : ngrok http 3000", YELLOW)
     return None
 
@@ -323,7 +321,7 @@ def main():
     # 8. Lancer ngrok et afficher le lien pour le binôme
     start_ngrok()
 
-    log("\n Projet lancé ! Bonne continuation 🎉\n", GREEN)
+    log("\n Projet lancé ! Bonne continuation \n", GREEN)
     log("   Pour tout arrêter proprement :", YELLOW)
     log("    python3 start_project.py --stop\n", YELLOW)
 

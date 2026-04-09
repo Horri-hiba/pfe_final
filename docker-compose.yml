@@ -111,6 +111,7 @@ networks:
     driver: bridge
   batch-net:
     external: true
+    name: test-pfe_batch-net  
 
 volumes:
   grafana-data:

@@ -456,8 +456,8 @@ def write_silver(spark, bronze_df):
             col("is_vpn_failure"),
         ).filter(col("event_time").isNotNull())
 
-    # coalesce(2) : limite les writers Parquet parallèles pour économiser la mémoire
-    df_write = df.coalesce(2)
+    # coalesce(4) : limite les writers Parquet parallèles pour économiser la mémoire
+    df_write = df.coalesce(4) 
     # Compter AVANT le write pour éviter un double scan du DataFrame
     cnt = df_write.count()
     df_write.write.format("iceberg").mode("append").saveAsTable(
@@ -616,6 +616,8 @@ def main():
         .option("subscribe", TOPICS)
         .option("startingOffsets", "earliest")
         .option("endingOffsets", "latest")
+        .option("maxOffsetsPerTrigger", "500000")   
+        .option("kafka.max.partition.fetch.bytes", "1048576")  
         .load()
     )
 

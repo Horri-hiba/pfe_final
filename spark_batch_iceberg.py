@@ -91,6 +91,11 @@ def build_spark():
     return (
         SparkSession.builder
         .appName("FortiGateBatchPipeline-Iceberg")
+         # --- LIMITES MÉMOIRE POUR 8GB RAM ---
+        .config("spark.driver.memory", "1g")
+        .config("spark.executor.memory", "1g")
+        .config("spark.memory.offHeap.size", "256m") 
+        # ------------------------------------
         .config("spark.sql.extensions",
                 "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
         .config("spark.sql.catalog.iceberg",
@@ -472,8 +477,8 @@ def write_gold(spark, silver_df):
     Gold : KPIs et agrégats.
     Miroir des vues analytiques Grafana real-time :
       v_severity_per_hour, v_top_threat_ips, v_device_summary, v_high_latency
-    """
-    silver_cached = silver_df.repartition(8).cache()
+       fonction write_gold, tu utilises .repartition(8).cache(). Sur une machine de 8 GB, le cache est ton ennemi car il sature la RAM très vitefonction write_gold, tu utilises .repartition(8).cache(). Sur une machine de 8 GB, le cache est ton ennemi car il sature la RAM très vite"""
+    silver_cached = silver_df
     silver_cached.count()
 
     # ── KPI horaires (miroir v_severity_per_hour + stats perf) ───────────────

@@ -97,6 +97,19 @@ services:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
+      GF_SMTP_ENABLED: "true"
+      GF_SMTP_HOST: smtp.gmail.com:587
+      GF_SMTP_USER: hibapfe01@gmail.com
+      GF_SMTP_PASSWORD: rwzzwggknviheoqz
+      GF_SMTP_FROM_ADDRESS: hibapfe01@gmail.com
+      GF_SMTP_FROM_NAME: Garafana
+      GF_SMTP_STARTTLS_POLICY: MandatoryStartTLS
+      GF_SMTP_SKIP_VERIFY: "true"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    restart: always
     volumes:
       - grafana-data:/var/lib/grafana
     depends_on:

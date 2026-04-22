@@ -1,2 +1,7 @@
 spark-jars/
 data/logs.csv
+venv/
+data/
+*.jar
+.DS_Store
+__pycache__/

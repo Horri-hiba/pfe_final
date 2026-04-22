@@ -261,7 +261,11 @@ CREATE TABLE IF NOT EXISTS pfe_db.t_performance
     total_bytes     UInt64,
     latency         Float32,
     sessionid       String,
-    vwlid           UInt8,
+
+    max(ts)                 AS last_occurrence
+FROM pfe_db.t_security
+GROUP BY message
+ORDER BY occurrences DESC;(venv) hiba@DESKTOP-EAPUR9F:~    vwlid           UInt8,
     vwlquality      String,
     devname         String,
     devtype         String,

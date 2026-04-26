@@ -1,16 +1,15 @@
 """
 Spark Batch Pipeline — FortiGate Network Logs
-Aligné sur le schéma real-time (Vector → ClickHouse)
+Architecture : Kafka → Bronze (raw) → Silver (cleaned) → Gold (aggregated)
+Stockage     : Apache Iceberg on MinIO S3 via REST catalog
+Requête      : Trino → Grafana
 
-Kafka topics batch :
-  network_security, network_traffic, network_perf, network_devices, network_all
-
-→ Iceberg Bronze / Silver / Gold  (MinIO S3 via REST catalog)
-
-Schéma identique au real-time :
-  srcip, dstip, action, status, severity_label, is_anomaly,
-  latency, sentbyte, rcvdbyte, total_bytes, vwlid, vwlquality,
-  devtype, srchwvendor, srcmac, policyname, service, sessionid ...
+Optimisations clés pour 8GB RAM :
+  1. Ecrire chaque étape sur disque (Iceberg) et relire les tables
+  2. OverwritePartitions pour idempotence (pas de doublons)
+  3. Pas de .cache() / pas de .repartition() agressif
+  4. Compression ZSTD (meilleur ratio que "uncompressed")
+  5. AQE (Adaptive Query Execution) activé
 """
 
 from pyspark.sql import SparkSession
@@ -25,77 +24,78 @@ from pyspark.sql.types import (
     LongType, FloatType
 )
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Configuration ────────────────────────────────────────────────────────────
 MINIO_ENDPOINT   = "http://minio1:9000"
 MINIO_ACCESS_KEY = "minioadmin"
 MINIO_SECRET_KEY = "minioadmin"
 CATALOG_URI      = "http://iceberg-rest:8181"
 WAREHOUSE        = "s3://iceberg/"
 KAFKA_SERVERS    = "kafka-batch:9092"
-TOPICS           = "fg_security_events,fg_traffic_flow,fg_performance,fg_device_inventory,fg_raw_all"
+TOPICS           = "fg_raw_all,fg_security_events,fg_traffic_flow,fg_performance,fg_device_inventory"
 
-# ── Schéma JSON aligné sur Vector/real-time ───────────────────────────────────
-# Tous les champs FortiGate enrichis par Logstash (même logique que Vector)
+# Schéma JSON aligné avec la sortie Logstash et le pipeline Vector real-time
 MSG_SCHEMA = StructType([
-    # Identifiants
-    StructField("event_id",      StringType()),
-    StructField("device_id",     StringType()),
-    # Timestamps
-    StructField("ts",            StringType()),   # timestamp FortiGate original
-    StructField("eventtime",     StringType()),   # eventtime= du msg kv
-    StructField("ingested_at",   StringType()),
-    # Message
-    StructField("message",       StringType()),
-    StructField("tag",           StringType()),
-    StructField("program",       StringType()),
-    StructField("seq",           StringType()),
-    StructField("facility",      IntegerType()),
-    # Catégorisation FortiGate
-    StructField("event_type",    StringType()),
-    StructField("subtype",       StringType()),
-    StructField("action",        StringType()),
-    StructField("status",        StringType()),
-    # Réseau
-    StructField("srcip",         StringType()),
-    StructField("dstip",         StringType()),
-    StructField("srcport",       IntegerType()),
-    StructField("dstport",       IntegerType()),
-    StructField("proto",         IntegerType()),
-    StructField("service",       StringType()),
-    # Politique
-    StructField("policyname",    StringType()),
-    StructField("policytype",    StringType()),
-    StructField("poluuid",       StringType()),
-    # Métriques
-    StructField("sentbyte",      LongType()),
-    StructField("rcvdbyte",      LongType()),
-    StructField("total_bytes",   LongType()),
-    StructField("latency",       FloatType()),
-    StructField("sessionid",     StringType()),
-    # SD-WAN
-    StructField("vwlid",         IntegerType()),
-    StructField("vwlquality",    StringType()),
-    # Inventaire
-    StructField("devname",       StringType()),
-    StructField("devtype",       StringType()),
-    StructField("srchwvendor",   StringType()),
-    StructField("srcmac",        StringType()),
-    # Sévérité / anomalie
-    StructField("severity",      IntegerType()),
-    StructField("severity_label", StringType()),
-    StructField("is_anomaly",    IntegerType()),
+    StructField("event_id",       StringType(), True),
+    StructField("device_id",      StringType(), True),
+    StructField("ts",             StringType(), True),
+    StructField("eventtime",      StringType(), True),
+    StructField("ingested_at",    StringType(), True),
+    StructField("message",        StringType(), True),
+    StructField("tag",            StringType(), True),
+    StructField("program",        StringType(), True),
+    StructField("seq",            StringType(), True),
+    StructField("facility",       IntegerType(), True),
+    StructField("event_type",     StringType(), True),
+    StructField("subtype",        StringType(), True),
+    StructField("action",         StringType(), True),
+    StructField("status",         StringType(), True),
+    StructField("srcip",          StringType(), True),
+    StructField("dstip",          StringType(), True),
+    StructField("srcport",        IntegerType(), True),
+    StructField("dstport",        IntegerType(), True),
+    StructField("proto",          IntegerType(), True),
+    StructField("service",        StringType(), True),
+    StructField("policyname",     StringType(), True),
+    StructField("policytype",     StringType(), True),
+    StructField("poluuid",        StringType(), True),
+    StructField("sentbyte",       LongType(), True),
+    StructField("rcvdbyte",       LongType(), True),
+    StructField("total_bytes",    LongType(), True),
+    StructField("latency",        FloatType(), True),
+    StructField("sessionid",      StringType(), True),
+    StructField("vwlid",          IntegerType(), True),
+    StructField("vwlquality",     StringType(), True),
+    StructField("devname",        StringType(), True),
+    StructField("devtype",        StringType(), True),
+    StructField("srchwvendor",    StringType(), True),
+    StructField("srcmac",         StringType(), True),
+    StructField("severity",       IntegerType(), True),
+    StructField("severity_label", StringType(), True),
+    StructField("is_anomaly",     IntegerType(), True),
 ])
 
 
 def build_spark():
+    """
+    Construit une SparkSession optimisée pour une machine 8GB.
+    Toutes les configs catalogue sont ici (pas de duplication docker-compose).
+    """
     return (
         SparkSession.builder
         .appName("FortiGateBatchPipeline-Iceberg")
-         # --- LIMITES MÉMOIRE POUR 8GB RAM ---
-        .config("spark.driver.memory", "1g")
-        .config("spark.executor.memory", "1g")
-        .config("spark.memory.offHeap.size", "256m") 
-        # ------------------------------------
+        # ── Tuning mémoire 8GB ──
+        .config("spark.driver.memory", "1536m")
+        .config("spark.executor.memory", "1536m")
+        .config("spark.memory.offHeap.enabled", "true")
+        .config("spark.memory.offHeap.size", "512m")
+        .config("spark.memory.fraction", "0.6")
+        .config("spark.memory.storageFraction", "0.3")
+        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.default.parallelism", "4")
+        .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+        .config("spark.sql.adaptive.skewJoin.enabled", "true")
+        # ── Iceberg REST Catalog ──
         .config("spark.sql.extensions",
                 "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
         .config("spark.sql.catalog.iceberg",
@@ -111,12 +111,8 @@ def build_spark():
         .config("spark.sql.catalog.iceberg.s3.secret-access-key", MINIO_SECRET_KEY)
         .config("spark.sql.catalog.iceberg.s3.region", "us-east-1")
         .config("spark.sql.catalog.iceberg.client.region", "us-east-1")
-        .config("spark.sql.iceberg.compression-codec", "uncompressed")
-        .config("spark.sql.shuffle.partitions", "2")
-        .config("spark.memory.fraction", "0.6")
-        .config("spark.memory.storageFraction", "0.3")
-        .config("spark.memory.offHeap.enabled", "true")
-        .config("spark.memory.offHeap.size", "512m")
+        .config("spark.sql.iceberg.compression-codec", "zstd")
+        # ── S3A fallback (si accès direct Hadoop) ──
         .config("spark.hadoop.fs.s3a.endpoint", MINIO_ENDPOINT)
         .config("spark.hadoop.fs.s3a.access.key", MINIO_ACCESS_KEY)
         .config("spark.hadoop.fs.s3a.secret.key", MINIO_SECRET_KEY)
@@ -130,14 +126,11 @@ def build_spark():
 
 
 def ensure_tables(spark):
-    """
-    Crée les namespaces et tables Iceberg.
-    Schéma aligné sur le real-time ClickHouse (même champs FortiGate).
-    """
+    """Crée les namespaces et tables Iceberg si inexistants."""
     for ns in ["bronze", "silver", "gold"]:
         spark.sql(f"CREATE NAMESPACE IF NOT EXISTS iceberg.{ns}")
 
-    # ── BRONZE — données brutes FortiGate (tous champs) ───────────────────────
+    # ── BRONZE : ingestion brute (tous champs) ─────────────────────────────
     spark.sql("""
         CREATE TABLE IF NOT EXISTS iceberg.bronze.fg_events_raw (
             ingested_at     TIMESTAMP,
@@ -181,10 +174,10 @@ def ensure_tables(spark):
             is_anomaly      INT
         ) USING iceberg
         PARTITIONED BY (days(ingested_at))
+        TBLPROPERTIES ('write_compression'='zstd')
     """)
 
-    # ── SILVER — données nettoyées et typées ──────────────────────────────────
-    # Miroir du schéma ClickHouse t_raw_events (real-time)
+    # ── SILVER : nettoyé et typé (miroir ClickHouse real-time) ─────────────
     spark.sql("""
         CREATE TABLE IF NOT EXISTS iceberg.silver.fg_events_clean (
             ingested_at     TIMESTAMP,
@@ -229,9 +222,10 @@ def ensure_tables(spark):
             is_vpn_failure  INT
         ) USING iceberg
         PARTITIONED BY (days(event_time), bucket(16, device_id))
+        TBLPROPERTIES ('write_compression'='zstd')
     """)
 
-    # ── GOLD — KPIs horaires (miroir des vues Grafana real-time) ─────────────
+    # ── GOLD : KPIs horaires (partitionné pour Trino/Grafana) ──────────────
     spark.sql("""
         CREATE TABLE IF NOT EXISTS iceberg.gold.fg_kpi_hourly (
             window_start    TIMESTAMP,
@@ -250,9 +244,11 @@ def ensure_tables(spark):
             unique_devices  BIGINT,
             unique_srcip    BIGINT
         ) USING iceberg
+        PARTITIONED BY (days(window_start))
+        TBLPROPERTIES ('write_compression'='zstd')
     """)
 
-    # ── GOLD — Inventaire devices (miroir t_devices real-time) ───────────────
+    # ── GOLD : inventaire devices ──────────────────────────────────────────
     spark.sql("""
         CREATE TABLE IF NOT EXISTS iceberg.gold.fg_device_inventory (
             device_id       STRING,
@@ -267,9 +263,10 @@ def ensure_tables(spark):
             total_bytes     BIGINT,
             last_seen       TIMESTAMP
         ) USING iceberg
+        TBLPROPERTIES ('write_compression'='zstd')
     """)
 
-    # ── GOLD — Top IPs suspectes (miroir v_top_threat_ips real-time) ─────────
+    # ── GOLD : top IPs suspectes ─────────────────────────────────────────────
     spark.sql("""
         CREATE TABLE IF NOT EXISTS iceberg.gold.fg_top_threat_ips (
             srcip           STRING,
@@ -278,9 +275,10 @@ def ensure_tables(spark):
             total_events    BIGINT,
             last_alert      TIMESTAMP
         ) USING iceberg
+        TBLPROPERTIES ('write_compression'='zstd')
     """)
 
-    # ── GOLD — Performance SD-WAN par lien ────────────────────────────────────
+    # ── GOLD : SD-WAN performance (partitionné) ──────────────────────────
     spark.sql("""
         CREATE TABLE IF NOT EXISTS iceberg.gold.fg_sdwan_performance (
             window_start        TIMESTAMP,
@@ -293,9 +291,11 @@ def ensure_tables(spark):
             total_sessions      BIGINT,
             total_bytes         BIGINT
         ) USING iceberg
+        PARTITIONED BY (days(window_start))
+        TBLPROPERTIES ('write_compression'='zstd')
     """)
 
-    # ── GOLD — Trafic par politique FortiGate ─────────────────────────────────
+    # ── GOLD : trafic par politique ────────────────────────────────────────
     spark.sql("""
         CREATE TABLE IF NOT EXISTS iceberg.gold.fg_policy_traffic (
             policyname          STRING,
@@ -307,9 +307,10 @@ def ensure_tables(spark):
             unique_src_ips      BIGINT,
             unique_dst_ips      BIGINT
         ) USING iceberg
+        TBLPROPERTIES ('write_compression'='zstd')
     """)
 
-    # ── GOLD — Distribution des protocoles applicatifs par jour ──────────────
+    # ── GOLD : stats protocoles par jour (partitionné) ───────────────────
     spark.sql("""
         CREATE TABLE IF NOT EXISTS iceberg.gold.fg_protocol_stats (
             day                 TIMESTAMP,
@@ -320,14 +321,40 @@ def ensure_tables(spark):
             avg_latency_ms      DOUBLE,
             unique_sources      BIGINT
         ) USING iceberg
+        PARTITIONED BY (days(day))
+        TBLPROPERTIES ('write_compression'='zstd')
     """)
 
-    print("[TABLES] Iceberg OK — bronze/silver/gold alignés sur schéma real-time")
+    print("[TABLES] Tables Iceberg bronze/silver/gold verifiees.")
 
 
-def write_bronze(spark, raw_kafka):
-    """Bronze : données brutes FortiGate depuis Kafka — tous champs préservés."""
-    df = raw_kafka.select(
+def write_bronze(spark):
+    """
+    Étape 1 : Kafka → Bronze
+    - Lit tous les offsets disponibles (earliest → latest)
+    - Dédoublonne sur event_id (dans le micro-batch courant)
+    - ECRASE les partitions existantes (idempotence totale)
+    """
+    print(f"[BRONZE] Lecture Kafka : {TOPICS}")
+    raw_kafka = (
+        spark.read.format("kafka")
+        .option("kafka.bootstrap.servers", KAFKA_SERVERS)
+        .option("subscribe", TOPICS)
+        .option("startingOffsets", "earliest")
+        .option("endingOffsets", "latest")
+        .option("maxOffsetsPerTrigger", "500000")
+        .option("kafka.max.partition.fetch.bytes", "1048576")
+        .load()
+    )
+
+    total_kafka = raw_kafka.count()
+    print(f"[BRONZE] {total_kafka} messages bruts extraits de Kafka")
+
+    parsed = raw_kafka.withColumn(
+        "data", from_json(col("value").cast("string"), MSG_SCHEMA)
+    )
+
+    df = parsed.select(
         current_timestamp().alias("ingested_at"),
         col("topic").alias("kafka_topic"),
         col("offset").cast("long").alias("kafka_offset"),
@@ -368,32 +395,38 @@ def write_bronze(spark, raw_kafka):
         col("data.severity_label"),
         col("data.is_anomaly"),
     ).filter(
-        col("data.device_id").isNotNull() & (trim(col("data.device_id")) != "")
-    )
+        col("device_id").isNotNull() & (trim(col("device_id")) != "")
+    ).dropDuplicates(["event_id"])
 
-    # Dédupliquer : un même event_id peut arriver dans plusieurs topics
-    df_dedup = df.dropDuplicates(["event_id"])
+    # Idempotence : overwritePartitions remplace les partitions jour déjà existantes
+    df.coalesce(4).writeTo("iceberg.bronze.fg_events_raw") \
+        .using("iceberg") \
+        .option("write_compression", "zstd") \
+        .overwritePartitions()
 
-    df_dedup.write.format("iceberg").mode("append").saveAsTable(
-        "iceberg.bronze.fg_events_raw"
-    )
-    cnt = df_dedup.count()
-    print(f"[BRONZE] {cnt} lignes → iceberg.bronze.fg_events_raw")
-    return df_dedup
+    cnt = df.count()
+    print(f"[BRONZE] {cnt} evenements dedupliques → iceberg.bronze.fg_events_raw")
+    return cnt
 
 
-def write_silver(spark, bronze_df):
+def write_silver(spark):
     """
-    Silver : nettoyage et typage.
-    Même transformation que ClickHouse mv_* (real-time).
+    Étape 2 : Bronze → Silver
+    - Lit la table Bronze fraîchement écrite (libère la mémoire inter-étape)
+    - Nettoie, type, enrichit
+    - ECRASE les partitions Silver existantes
     """
-    df = bronze_df \
+    print("[SILVER] Lecture table Bronze...")
+    bronze = spark.table("iceberg.bronze.fg_events_raw")
+
+    df = bronze \
         .withColumn(
             "event_time",
             coalesce(
                 to_timestamp(trim(col("ts")), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"),
                 to_timestamp(trim(col("ts")), "yyyy-MM-dd HH:mm:ss"),
                 to_timestamp(trim(col("ts")), "yyyy-MM-dd'T'HH:mm:ss"),
+                to_timestamp(trim(col("eventtime")), "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"),
                 current_timestamp()
             )
         ) \
@@ -433,25 +466,25 @@ def write_silver(spark, bronze_df):
             trim(col("status")).alias("status"),
             trim(col("srcip")).alias("srcip"),
             trim(col("dstip")).alias("dstip"),
-            col("srcport"),
-            col("dstport"),
-            col("proto"),
+            coalesce(col("srcport"), lit(0)).alias("srcport"),
+            coalesce(col("dstport"), lit(0)).alias("dstport"),
+            coalesce(col("proto"), lit(0)).alias("proto"),
             trim(col("service")).alias("service"),
             trim(col("policyname")).alias("policyname"),
             trim(col("policytype")).alias("policytype"),
             trim(col("poluuid")).alias("poluuid"),
-            coalesce(col("sentbyte"),   lit(0)).alias("sentbyte"),
-            coalesce(col("rcvdbyte"),   lit(0)).alias("rcvdbyte"),
-            coalesce(col("total_bytes"),lit(0)).alias("total_bytes"),
-            coalesce(col("latency"),    lit(0.0)).alias("latency"),
+            coalesce(col("sentbyte"), lit(0)).alias("sentbyte"),
+            coalesce(col("rcvdbyte"), lit(0)).alias("rcvdbyte"),
+            coalesce(col("total_bytes"), lit(0)).alias("total_bytes"),
+            coalesce(col("latency"), lit(0.0)).alias("latency"),
             trim(col("sessionid")).alias("sessionid"),
-            coalesce(col("vwlid"),      lit(0)).alias("vwlid"),
+            coalesce(col("vwlid"), lit(0)).alias("vwlid"),
             trim(col("vwlquality")).alias("vwlquality"),
             trim(col("devname")).alias("devname"),
             trim(col("devtype")).alias("devtype"),
             trim(col("srchwvendor")).alias("srchwvendor"),
             trim(col("srcmac")).alias("srcmac"),
-            coalesce(col("severity"),   lit(1)).alias("severity"),
+            coalesce(col("severity"), lit(1)).alias("severity"),
             trim(col("severity_label")).alias("severity_label"),
             coalesce(col("is_anomaly"), lit(0)).alias("is_anomaly"),
             col("hour_of_day"),
@@ -461,28 +494,29 @@ def write_silver(spark, bronze_df):
             col("is_vpn_failure"),
         ).filter(col("event_time").isNotNull())
 
-    # coalesce(4) : limite les writers Parquet parallèles pour économiser la mémoire
-    df_write = df.coalesce(4) 
-    # Compter AVANT le write pour éviter un double scan du DataFrame
-    cnt = df_write.count()
-    df_write.write.format("iceberg").mode("append").saveAsTable(
-        "iceberg.silver.fg_events_clean"
-    )
-    print(f"[SILVER] {cnt} lignes → iceberg.silver.fg_events_clean")
-    return df_write
+    df.coalesce(4).writeTo("iceberg.silver.fg_events_clean") \
+        .using("iceberg") \
+        .option("write_compression", "zstd") \
+        .overwritePartitions()
+
+    cnt = df.count()
+    print(f"[SILVER] {cnt} evenements nettoyes → iceberg.silver.fg_events_clean")
+    return cnt
 
 
-def write_gold(spark, silver_df):
+def write_gold(spark):
     """
-    Gold : KPIs et agrégats.
-    Miroir des vues analytiques Grafana real-time :
-      v_severity_per_hour, v_top_threat_ips, v_device_summary, v_high_latency
-       fonction write_gold, tu utilises .repartition(8).cache(). Sur une machine de 8 GB, le cache est ton ennemi car il sature la RAM très vitefonction write_gold, tu utilises .repartition(8).cache(). Sur une machine de 8 GB, le cache est ton ennemi car il sature la RAM très vite"""
-    silver_cached = silver_df
-    silver_cached.count()
+    Étape 3 : Silver → Gold
+    - Lit la table Silver (pas de DataFrame en mémoire entre étapes)
+    - Calcule 6 tables d'agrégats
+    - Overwrite total (tables Gold petites, recalcul rapide et idempotent)
+    """
+    print("[GOLD] Lecture table Silver...")
+    silver = spark.table("iceberg.silver.fg_events_clean")
 
-    # ── KPI horaires (miroir v_severity_per_hour + stats perf) ───────────────
-    kpi = silver_cached.groupBy(
+    # ── 1) KPI horaires ────────────────────────────────────────────────────
+    print("[GOLD] Calcul KPI horaires...")
+    kpi = silver.groupBy(
         window(col("event_time"), "1 hour"),
         col("event_type"),
         col("severity_label"),
@@ -508,13 +542,16 @@ def write_gold(spark, silver_df):
         "total_bytes", "avg_bytes",
         "unique_devices", "unique_srcip",
     )
-    kpi.coalesce(4).write.format("iceberg").mode("append").saveAsTable(
-        "iceberg.gold.fg_kpi_hourly"
-    )
-    print(f"[GOLD] KPI horaires → iceberg.gold.fg_kpi_hourly")
 
-    # ── Inventaire devices (miroir v_device_summary real-time) ───────────────
-    devices = silver_cached.groupBy(
+    kpi.coalesce(2).writeTo("iceberg.gold.fg_kpi_hourly") \
+        .using("iceberg") \
+        .option("write_compression", "zstd") \
+        .overwritePartitions()
+    print("[GOLD] fg_kpi_hourly OK")
+
+    # ── 2) Inventaire devices ──────────────────────────────────────────────
+    print("[GOLD] Calcul inventaire devices...")
+    devices = silver.groupBy(
         "device_id", "devname", "devtype", "srchwvendor", "srcmac"
     ).agg(
         count("*").alias("total_events"),
@@ -525,13 +562,15 @@ def write_gold(spark, silver_df):
         spark_max("event_time").alias("last_seen"),
     ).filter(col("device_id").isNotNull())
 
-    devices.coalesce(4).write.format("iceberg").mode("append").saveAsTable(
-        "iceberg.gold.fg_device_inventory"
-    )
-    print(f"[GOLD] Inventaire devices → iceberg.gold.fg_device_inventory")
+    devices.coalesce(2).writeTo("iceberg.gold.fg_device_inventory") \
+        .using("iceberg") \
+        .option("write_compression", "zstd") \
+        .overwritePartitions()
+    print("[GOLD] fg_device_inventory OK")
 
-    # ── Top IPs suspectes (miroir v_top_threat_ips real-time) ─────────────────
-    threat_ips = silver_cached \
+    # ── 3) Top IPs suspectes ───────────────────────────────────────────────
+    print("[GOLD] Calcul top threat IPs...")
+    threat_ips = silver \
         .filter(col("is_anomaly") == 1) \
         .groupBy("srcip") \
         .agg(
@@ -542,13 +581,15 @@ def write_gold(spark, silver_df):
         ).filter(col("srcip").isNotNull() & (trim(col("srcip")) != "")) \
         .orderBy(col("nb_anomalies").desc())
 
-    threat_ips.coalesce(2).write.format("iceberg").mode("append").saveAsTable(
-        "iceberg.gold.fg_top_threat_ips"
-    )
-    print(f"[GOLD] Top IPs suspectes → iceberg.gold.fg_top_threat_ips")
+    threat_ips.coalesce(1).writeTo("iceberg.gold.fg_top_threat_ips") \
+        .using("iceberg") \
+        .option("write_compression", "zstd") \
+        .overwritePartitions()
+    print("[GOLD] fg_top_threat_ips OK")
 
-    # ── SD-WAN performance par lien (vwlid) ───────────────────────────────────
-    sdwan = silver_cached \
+    # ── 4) SD-WAN performance ────────────────────────────────────────────
+    print("[GOLD] Calcul SD-WAN performance...")
+    sdwan = silver \
         .filter(col("latency") > 0) \
         .groupBy("vwlid", window(col("event_time"), "1 hour")) \
         .agg(
@@ -565,13 +606,16 @@ def write_gold(spark, silver_df):
             "p95_latency_ms", "degraded_sessions",
             "critical_sessions", "total_sessions", "total_bytes"
         )
-    sdwan.coalesce(4).write.format("iceberg").mode("append").saveAsTable(
-        "iceberg.gold.fg_sdwan_performance"
-    )
-    print(f"[GOLD] SD-WAN performance → iceberg.gold.fg_sdwan_performance")
 
-    # ── Trafic par politique FortiGate ────────────────────────────────────────
-    policy = silver_cached \
+    sdwan.coalesce(2).writeTo("iceberg.gold.fg_sdwan_performance") \
+        .using("iceberg") \
+        .option("write_compression", "zstd") \
+        .overwritePartitions()
+    print("[GOLD] fg_sdwan_performance OK")
+
+    # ── 5) Trafic par politique ──────────────────────────────────────────
+    print("[GOLD] Calcul policy traffic...")
+    policy = silver \
         .filter(trim(col("policyname")) != "") \
         .groupBy("policyname", "policytype") \
         .agg(
@@ -582,13 +626,16 @@ def write_gold(spark, silver_df):
             countDistinct("srcip").alias("unique_src_ips"),
             countDistinct("dstip").alias("unique_dst_ips"),
         )
-    policy.coalesce(4).write.format("iceberg").mode("append").saveAsTable(
-        "iceberg.gold.fg_policy_traffic"
-    )
-    print(f"[GOLD] Trafic par politique → iceberg.gold.fg_policy_traffic")
 
-    # ── Distribution protocoles applicatifs par jour ──────────────────────────
-    proto_stats = silver_cached \
+    policy.coalesce(2).writeTo("iceberg.gold.fg_policy_traffic") \
+        .using("iceberg") \
+        .option("write_compression", "zstd") \
+        .overwritePartitions()
+    print("[GOLD] fg_policy_traffic OK")
+
+    # ── 6) Distribution protocoles par jour ────────────────────────────────
+    print("[GOLD] Calcul protocol stats...")
+    proto_stats = silver \
         .groupBy("tag", window(col("event_time"), "1 day")) \
         .agg(
             count("*").alias("total_sessions"),
@@ -601,45 +648,30 @@ def write_gold(spark, silver_df):
             "tag", "total_sessions", "anomaly_sessions",
             "total_bytes", "avg_latency_ms", "unique_sources"
         )
-    proto_stats.coalesce(4).write.format("iceberg").mode("append").saveAsTable(
-        "iceberg.gold.fg_protocol_stats"
-    )
-    print(f"[GOLD] Stats protocoles → iceberg.gold.fg_protocol_stats")
 
-    silver_cached.unpersist()
+    proto_stats.coalesce(2).writeTo("iceberg.gold.fg_protocol_stats") \
+        .using("iceberg") \
+        .option("write_compression", "zstd") \
+        .overwritePartitions()
+    print("[GOLD] fg_protocol_stats OK")
 
 
 def main():
     spark = build_spark()
     spark.sparkContext.setLogLevel("WARN")
+
+    # Optimisations Iceberg + AQE (déjà en partie dans build_spark)
+    spark.conf.set("spark.sql.iceberg.merge-on-read.enabled", "true")
+
     ensure_tables(spark)
 
-    print(f"[BATCH] Lecture Kafka topics : {TOPICS}")
-    raw_kafka = (
-        spark.read.format("kafka")
-        .option("kafka.bootstrap.servers", KAFKA_SERVERS)
-        .option("subscribe", TOPICS)
-        .option("startingOffsets", "earliest")
-        .option("endingOffsets", "latest")
-        .option("maxOffsetsPerTrigger", "500000")   
-        .option("kafka.max.partition.fetch.bytes", "1048576")  
-        .load()
-    )
-
-    # Parser le JSON de chaque message Kafka
-    parsed = raw_kafka.withColumn(
-        "data", from_json(col("value").cast("string"), MSG_SCHEMA)
-    )
-
-    total = raw_kafka.count()
-    print(f"[BATCH] {total} messages lus depuis Kafka")
-
-    b = write_bronze(spark, parsed)
-    s = write_silver(spark, b)
-    write_gold(spark, s)
+    # Exécution séquentielle avec persistance sur disque entre étapes
+    write_bronze(spark)
+    write_silver(spark)
+    write_gold(spark)
 
     print("\n" + "=" * 60)
-    print("[BATCH] Pipeline FortiGate terminé avec succès!")
+    print("[BATCH] Pipeline FortiGate termine avec succes!")
     print("  Bronze → iceberg.bronze.fg_events_raw")
     print("  Silver → iceberg.silver.fg_events_clean")
     print("  Gold   → iceberg.gold.fg_kpi_hourly")

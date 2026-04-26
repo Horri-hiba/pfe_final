@@ -1,0 +1,33 @@
+[sources.data2_socket]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:6001"
+decoding.codec = "json"
+
+[transforms.enrich_data2]
+type = "remap"
+inputs = ["data2_socket"]
+source = '''
+  ts_parsed, err = parse_timestamp(.ts, "%d/%m/%Y %H:%M")
+  if err != null {
+    ts_parsed = now()
+  }
+  .ts = format_timestamp!(ts_parsed, "%Y-%m-%d %H:%M:%S")
+  
+  if !exists(.event_id) { .event_id = uuid_v4() }
+  if !exists(.device_id) { .device_id = "unknown" }
+  if !exists(.program) { .program = "unknown" }
+  if !exists(.log_type) { .log_type = "unknown" }
+  if !exists(.message) { .message = "" }
+  if !exists(.src_ip) { .src_ip = "" }
+  if !exists(.dst_ip) { .dst_ip = "" }
+  if !exists(.mac_address) { .mac_address = "" }
+  if !exists(.raw_length) { .raw_length = length(to_string!(.message)) }
+'''
+
+[sinks.kafka_network]
+type = "kafka"
+inputs = ["enrich_data2"]
+bootstrap_servers = "kafka:9092"
+topic = "fg_network_logs"
+encoding.codec = "json"

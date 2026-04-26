@@ -66,6 +66,9 @@ if action == "deny" { is_anomaly = 1 }
 if action == "fail" { is_anomaly = 1 }
 if severity >= 4 { is_anomaly = 1 }
 
+event_id = uuid_v4()
+
+.event_id = event_id
 .device_id = device_id
 .ts = ts
 .program = program
@@ -92,6 +95,8 @@ if severity >= 4 { is_anomaly = 1 }
 .is_anomaly = is_anomaly
 
 .ingested_at = now()
+
+.message = msg_clean
 '''
 
 

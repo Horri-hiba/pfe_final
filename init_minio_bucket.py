@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Initialise MinIO: crée les buckets séparés pour chaque couche
-  - iceberg         → catalogue Iceberg REST (metadata)
-  - iceberg-bronze  → données brutes (Bronze)
-  - iceberg-silver  → données nettoyées (Silver)
-  - iceberg-gold    → KPIs agrégés (Gold)
-  - parquet-store   → fichiers Parquet bruts
+Initialise MinIO : crée les buckets nécessaires au pipeline batch Iceberg.
+
+NOTE : Dans cette version, toutes les tables Iceberg résident dans le bucket
+"iceberg" (warehouse=s3://iceberg/). Les buckets "iceberg-bronze",
+"iceberg-silver", "iceberg-gold" sont créés pour une future évolution
+(multi-warehouse) mais ne sont pas utilisés par Spark actuellement.
 """
 import boto3
 from botocore.client import Config
@@ -20,11 +20,11 @@ s3 = boto3.client(
 )
 
 BUCKETS = [
-    "iceberg",
-    "iceberg-bronze",
-    "iceberg-silver",
-    "iceberg-gold",
-    "parquet-store",
+    "iceberg",          # warehouse principal (metadata + data tables)
+    "iceberg-bronze",   # réservé future évolution
+    "iceberg-silver",   # réservé future évolution
+    "iceberg-gold",     # réservé future évolution
+    "parquet-store",    # stockage Parquet brut si besoin
 ]
 
 existing = [b["Name"] for b in s3.list_buckets().get("Buckets", [])]

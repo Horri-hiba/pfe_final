@@ -1,17 +1,19 @@
 services:
 
-  # ─── Zookeeper ───────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # INFRASTRUCTURE : Zookeeper + Kafka (batch isolé du real-time)
+  # ─────────────────────────────────────────────────────────────────────────
   zookeeper-batch:
-    image: wurstmeister/zookeeper
+    image: wurstmeister/zookeeper:latest
     container_name: zookeeper_batch
     ports:
       - "2182:2181"
+    mem_limit: 256m
     networks:
       - batch-net
 
-  # ─── Kafka ────────────────────────────────────────────────────────────────────
   kafka-batch:
-    image: wurstmeister/kafka
+    image: wurstmeister/kafka:latest
     container_name: kafka_batch
     depends_on:
       - zookeeper-batch
@@ -25,11 +27,22 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
       KAFKA_CREATE_TOPICS: "fg_raw_all:1:1,fg_security_events:1:1,fg_traffic_flow:1:1,fg_performance:1:1,fg_device_inventory:1:1"
+      # Rétention 7j pour laisser le temps au batch de consommer
+      KAFKA_LOG_RETENTION_HOURS: 168
+    mem_limit: 1024m
     networks:
       - batch-net
+    healthcheck:
+      test: ["CMD", "bash", "-c", "cat < /dev/null > /dev/tcp/localhost/9092"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
-  # ─── Unzip CSV ────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # PRÉPARATION : décompression des CSV
+  # ─────────────────────────────────────────────────────────────────────────
   unzipper:
     image: ubuntu:24.04
     container_name: unzipper_batch
@@ -37,28 +50,47 @@ services:
       - ./data:/data
       - ./unzip.sh:/unzip.sh
     command: bash /unzip.sh
+    mem_limit: 128m
     networks:
       - batch-net
 
-  # ─── Logstash: CSV → 4 Kafka topics ─────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # INGESTION : Logstash CSV → Kafka (5 topics)
+  # ─────────────────────────────────────────────────────────────────────────
   logstash:
     image: docker.elastic.co/logstash/logstash:8.13.0
     container_name: logstash_batch
     volumes:
-      - ./logstash-batch.conf:/usr/share/logstash/pipeline/logstash.conf
-      - ./data:/data
+      - ./logstash-batch.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+      - ./data:/data:ro
     environment:
-      LS_JAVA_OPTS: "-Xmx512m -Xms512m"
+      LS_JAVA_OPTS: "-Xms512m -Xmx512m"
+      PIPELINE_WORKERS: 1
+      PIPELINE_BATCH_SIZE: 250
     entrypoint: ["/bin/bash", "-c"]
-    command: ["until bash -c 'cat < /dev/null > /dev/tcp/kafka-batch/9092' 2>/dev/null; do echo '[WAIT] Kafka pas pret, attente 5s...'; sleep 5; done && echo '[WAIT] Kafka pret!' && sleep 3 && exec /usr/share/logstash/bin/logstash"]
+    command:
+      - |
+        echo "[WAIT] Kafka..."
+        for i in $(seq 1 30); do
+          if bash -c 'cat < /dev/null > /dev/tcp/kafka-batch/9092' 2>/dev/null; then
+            echo "[WAIT] Kafka OK — démarrage Logstash"
+            sleep 3
+            exec /usr/share/logstash/bin/logstash
+          fi
+          echo "[WAIT] tentative $$i/30..."
+          sleep 5
+        done
+        echo "[ERROR] Kafka indisponible"; exit 1
     depends_on:
       - kafka-batch
       - unzipper
+    mem_limit: 1024m
     networks:
       - batch-net
 
-  # ─── MinIO Distributed Cluster (4 nœuds) ─────────────────────────────────────
-
+  # ─────────────────────────────────────────────────────────────────────────
+  # STOCKAGE OBJET : MinIO (4 nœuds distribués — mode éco RAM)
+  # ─────────────────────────────────────────────────────────────────────────
   minio1:
     image: quay.io/minio/minio:latest
     container_name: minio1_batch
@@ -69,11 +101,11 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-      MINIO_SITE_NAME: batch-cluster
     volumes:
       - minio1-data:/data
+    mem_limit: 512m
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 15
@@ -88,11 +120,11 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-      MINIO_SITE_NAME: batch-cluster
     volumes:
       - minio2-data:/data
+    mem_limit: 512m
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 15
@@ -107,11 +139,11 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-      MINIO_SITE_NAME: batch-cluster
     volumes:
       - minio3-data:/data
+    mem_limit: 512m
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 15
@@ -126,33 +158,38 @@ services:
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-      MINIO_SITE_NAME: batch-cluster
     volumes:
       - minio4-data:/data
+    mem_limit: 512m
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 15
     networks:
       - batch-net
 
-  # ─── Init buckets MinIO ───────────────────────────────────────────────────────
-  # Attend que TOUS les 4 nœuds soient healthy avant de créer les buckets
+  # ─────────────────────────────────────────────────────────────────────────
+  # INIT : création des buckets (attend les 4 nœuds healthy)
+  # ─────────────────────────────────────────────────────────────────────────
   minio-init:
     image: python:3.12-slim
     container_name: minio_init_batch
     volumes:
-      - ./init_minio_bucket.py:/app/init_minio_bucket.py
+      - ./init_minio_bucket.py:/app/init_minio_bucket.py:ro
     working_dir: /app
     command: >
       sh -c "
-      pip install boto3 --quiet &&
-      until python init_minio_bucket.py; do
-        echo 'MinIO cluster not ready, retrying...';
-        sleep 3;
-      done
+        pip install boto3 --quiet &&
+        echo '[INIT] Waiting for MinIO cluster...' &&
+        for i in \$(seq 1 60); do
+          python init_minio_bucket.py && exit 0;
+          echo '[INIT] Retry \$${i}/60...';
+          sleep 3;
+        done;
+        echo '[INIT] Failed'; exit 1
       "
+    mem_limit: 256m
     networks:
       - batch-net
     depends_on:
@@ -165,7 +202,9 @@ services:
       minio4:
         condition: service_healthy
 
-  # ─── Iceberg REST Catalog ─────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # CATALOGUE : Iceberg REST (couche métadonnées)
+  # ─────────────────────────────────────────────────────────────────────────
   iceberg-rest:
     image: tabulario/iceberg-rest:latest
     container_name: iceberg_rest_batch
@@ -180,6 +219,7 @@ services:
       AWS_S3_ENDPOINT: http://minio1:9000
     ports:
       - "8181:8181"
+    mem_limit: 512m
     networks:
       - batch-net
     depends_on:
@@ -187,8 +227,18 @@ services:
         condition: service_healthy
       minio-init:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8181/v1/config"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
 
-  # ─── Spark: Kafka → Bronze / Silver / Gold ────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # TRAITEMENT : Spark Batch (Bronze → Silver → Gold)
+  #   - Le job est ONE-SHOT (pas de restart automatique)
+  #   - Les configs mémoire sont calibrées pour 8GB hôte total
+  #   - Les jars Iceberg/Kafka/S3A doivent être dans ./spark-jars/
+  # ─────────────────────────────────────────────────────────────────────────
   spark-batch:
     image: apache/spark:3.5.3-scala2.12-java11-python3-ubuntu
     container_name: spark_batch
@@ -202,31 +252,82 @@ services:
       - ./spark_batch_iceberg.py:/opt/spark/work-dir/spark_batch_iceberg.py
       - ./spark-jars:/opt/spark/extra-jars
     entrypoint: ["/bin/bash", "-c"]
-    command: ["apt-get install -y -q curl 2>/dev/null || true && echo 'Waiting for MinIO cluster...' && until curl -sf http://minio1:9000/minio/health/live && curl -sf http://minio2:9000/minio/health/live && curl -sf http://minio3:9000/minio/health/live && curl -sf http://minio4:9000/minio/health/live; do echo 'MinIO cluster not ready...'; sleep 3; done && echo 'MinIO cluster OK (4/4 nodes)' && echo 'Waiting for Iceberg REST...' && until curl -sf http://iceberg-rest:8181/v1/config; do echo 'Iceberg REST not ready...'; sleep 3; done && echo 'Iceberg REST OK' && echo 'Waiting for Kafka...' && until bash -c 'cat < /dev/null > /dev/tcp/kafka-batch/9092' 2>/dev/null; do echo 'Kafka not ready...'; sleep 3; done && echo 'ALL SERVICES READY - Starting Spark...' && sleep 5 && chmod 755 /opt/spark/work-dir/spark_batch_iceberg.py && /opt/spark/bin/spark-submit --master local[*] --driver-memory 3g --conf spark.driver.maxResultSize=512m --conf spark.memory.fraction=0.8 --conf spark.sql.shuffle.partitions=4 --conf spark.default.parallelism=4 --jars /opt/spark/extra-jars/iceberg-spark-runtime-3.5_2.12-1.5.0.jar,/opt/spark/extra-jars/spark-sql-kafka-0-10_2.12-3.5.3.jar,/opt/spark/extra-jars/spark-token-provider-kafka-0-10_2.12-3.5.3.jar,/opt/spark/extra-jars/kafka-clients-3.4.1.jar,/opt/spark/extra-jars/bundle-2.21.1.jar,/opt/spark/extra-jars/hadoop-aws-3.3.4.jar,/opt/spark/extra-jars/aws-java-sdk-bundle-1.12.262.jar,/opt/spark/extra-jars/commons-pool2-2.11.1.jar --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.sql.catalog.iceberg=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.iceberg.type=rest --conf spark.sql.catalog.iceberg.uri=http://iceberg-rest:8181 --conf spark.sql.catalog.iceberg.warehouse=s3://iceberg/ --conf spark.sql.catalog.iceberg.io-impl=org.apache.iceberg.aws.s3.S3FileIO --conf spark.sql.catalog.iceberg.s3.endpoint=http://minio1:9000 --conf spark.hadoop.fs.s3a.endpoint=http://minio1:9000 --conf spark.hadoop.fs.s3a.access.key=minioadmin --conf spark.hadoop.fs.s3a.secret.key=minioadmin --conf spark.hadoop.fs.s3a.path.style.access=true --conf spark.sql.catalog.iceberg.s3.region=us-east-1 --conf spark.sql.catalog.iceberg.client.region=us-east-1 --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider --conf spark.driver.extraJavaOptions=-Daws.region=us-east-1 --conf spark.executor.extraJavaOptions=-Daws.region=us-east-1 /opt/spark/work-dir/spark_batch_iceberg.py"]
+    command:
+      - |
+        echo "[SPARK] Attente services..."
+
+        # Attente MinIO
+        for node in minio1 minio2 minio3 minio4; do
+          until curl -sf http://$${node}:9000/minio/health/live; do
+            echo "[SPARK] Waiting $${node}..."; sleep 3
+          done
+        done
+        echo "[SPARK] MinIO cluster OK"
+
+        # Attente Iceberg REST
+        until curl -sf http://iceberg-rest:8181/v1/config; do
+          echo "[SPARK] Waiting Iceberg REST..."; sleep 3
+        done
+        echo "[SPARK] Iceberg REST OK"
+
+        # Attente Kafka
+        until bash -c 'cat < /dev/null > /dev/tcp/kafka-batch/9092' 2>/dev/null; do
+          echo "[SPARK] Waiting Kafka..."; sleep 3
+        done
+        echo "[SPARK] Kafka OK"
+
+        # Petite pause de stabilité
+        sleep 5
+
+        chmod 755 /opt/spark/work-dir/spark_batch_iceberg.py
+
+        exec /opt/spark/bin/spark-submit \
+          --master local[*] \
+          --driver-memory 1536m \
+          --conf spark.driver.maxResultSize=512m \
+          --conf spark.memory.fraction=0.6 \
+          --conf spark.memory.storageFraction=0.3 \
+          --conf spark.sql.shuffle.partitions=4 \
+          --conf spark.default.parallelism=4 \
+          --conf spark.sql.adaptive.enabled=true \
+          --conf spark.sql.adaptive.coalescePartitions.enabled=true \
+          --jars /opt/spark/extra-jars/iceberg-spark-runtime-3.5_2.12-1.5.0.jar,/opt/spark/extra-jars/spark-sql-kafka-0-10_2.12-3.5.3.jar,/opt/spark/extra-jars/spark-token-provider-kafka-0-10_2.12-3.5.3.jar,/opt/spark/extra-jars/kafka-clients-3.4.1.jar,/opt/spark/extra-jars/hadoop-aws-3.3.4.jar,/opt/spark/extra-jars/aws-java-sdk-bundle-1.12.262.jar,/opt/spark/extra-jars/commons-pool2-2.11.1.jar,/opt/spark/extra-jars/bundle-2.21.1.jar \
+          /opt/spark/work-dir/spark_batch_iceberg.py
+    mem_limit: 2560m
     networks:
       - batch-net
     depends_on:
       - kafka-batch
       - iceberg-rest
       - logstash
-    restart: on-failure
+    # PAS de restart : un job batch doit s'exécuter une seule fois
 
-  # ─── Trino ────────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # REQUÊTE : Trino (SQL ad-hoc + source Grafana)
+  # ─────────────────────────────────────────────────────────────────────────
   trino:
-    image: trinodb/trino:439
+    image: trinodb/trino:453
     container_name: trino_batch
     ports:
       - "8080:8080"
     volumes:
-      - ./trino/catalog:/etc/trino/catalog
+      - ./trino/catalog:/etc/trino/catalog:ro
+    mem_limit: 1536m
     networks:
       - batch-net
     depends_on:
       - iceberg-rest
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/v1/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
 
-  # ─── Grafana ──────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # VISUALISATION : Grafana (datasource Trino installé)
+  # ─────────────────────────────────────────────────────────────────────────
   grafana-batch:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.1.0
     container_name: grafana_batch
     ports:
       - "3001:3000"
@@ -236,6 +337,7 @@ services:
       GF_INSTALL_PLUGINS: "trino-datasource"
     volumes:
       - grafana-batch-data:/var/lib/grafana
+    mem_limit: 256m
     networks:
       - batch-net
     depends_on:

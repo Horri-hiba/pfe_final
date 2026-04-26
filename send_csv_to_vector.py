@@ -5,11 +5,13 @@ from pathlib import Path
 # =========================
 # CONFIG
 # =========================
-VECTOR_HOST = "localhost"
+#VECTOR_HOST = "localhost"
+VECTOR_HOST = "vector"
 VECTOR_PORT = 6000
 
 SEND_INTERVAL = 0.01   # 1 ligne par seconde
-DATA_DIR = Path("./data/data1")
+#DATA_DIR = Path("./data/data1")
+DATA_DIR = Path("/data/data1")
 
 
 # =========================

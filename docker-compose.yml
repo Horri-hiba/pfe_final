@@ -87,7 +87,36 @@ services:
       retries: 10
     networks:
       - pfe-net
+  # --- NOUVEAU : Vector pour data2 (port 6001) ---
+  vector_data2:
+    image: timberio/vector:0.36.0-debian
+    container_name: vector_data2
+    volumes:
+      - ./vector_data2.toml:/etc/vector/vector.toml
+      - ./data:/data
+    command: ["--config", "/etc/vector/vector.toml"]
+    ports:
+      - "6001:6001"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - pfe-net
 
+  # --- NOUVEAU : Python sender pour data2 ---
+  python_sender_data2:
+    image: python:3.12-slim
+    container_name: python_sender_data2
+    volumes:
+      - ./data:/data
+      - ./send_csv_to_vector_data2.py:/app/send_csv_to_vector_data2.py
+    working_dir: /app
+    command: ["python", "send_csv_to_vector_data2.py"]
+    networks:
+      - pfe-net
+    depends_on:
+      - vector_data2
+    restart: on-failure
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
